@@ -1,5 +1,5 @@
 # Go Apache-Downloader
-For when you want to download a whole directory from an apache fileserver.
+A little download client for when you want to download a whole directory from an apache fileserver.
 This tool traverses the directoy tree and loads all files within into the current directoy.
 
 The Apache server needs to support the F parameter. (e.g. http://ubuntu.mirror.tudos.de/ubuntu/?F=0)
