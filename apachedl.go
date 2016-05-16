@@ -39,6 +39,22 @@ func fixPath(path string) string {
 }
 
 
+func cleanName(name string) string {
+
+    result := ""
+
+    for _, nameChar := range name {
+        if strings.ContainsRune("<>:/|?*\"\\", nameChar) {
+            result = result + "-"
+        } else {
+            result = result + fmt.Sprintf("%c", nameChar)
+        }
+    }
+    
+    return result
+}
+
+
 func asyncHttpGetDir(dirUrl string) *HttpResponse {
     ch := make(chan *HttpResponse)
 
@@ -71,6 +87,7 @@ func asyncHttpGetFile(fileUrl string) bool {
     go func(fileUrl string) {
         parts := strings.Split(fileUrl, "/")
         fileName, _ := url.QueryUnescape(parts[len(parts) - 1])
+        fileName = cleanName(fileName)
         
         // check if file exists or skip
         if _, err := os.Stat(fileName); err == nil {
@@ -139,6 +156,7 @@ func recursiveLoadDir(dirUrl string) bool {
     if len(q.ATags) > 1 {
         parts := strings.Split(dirUrl, "/")
         dirName, err := url.QueryUnescape(parts[len(parts) - 2])
+        dirName = cleanName(dirName)
         
         if _, err := os.Stat(dirName); os.IsNotExist(err) {
             fmt.Printf("\ncreate dir: '%s'\n", dirName)
