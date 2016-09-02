@@ -15,8 +15,8 @@ import (
     "bufio"
 )
 
-var name, pw, dirUrl string
-var client *http.Client 
+var name, pw, dirUrl, target string
+var client *http.Client
 
 
 type HttpResponse struct {
@@ -30,7 +30,7 @@ func fixPath(path string) string {
     pwd, err := os.Getwd()
     if err != nil { panic(err) }
 
-    result := pwd + "\\" + path
+    result := pwd + string(os.PathSeparator) + path
     // fix to long pathes for windows
     if len(result) > 259 && runtime.GOOS == "windows" {
         result = "\\\\?\\" + result
@@ -50,7 +50,7 @@ func cleanName(name string) string {
             result = result + fmt.Sprintf("%c", nameChar)
         }
     }
-    
+
     return result
 }
 
@@ -60,11 +60,11 @@ func asyncHttpGetDir(dirUrl string) *HttpResponse {
 
     go func(url string) {
         fmt.Printf("\nDownloading directory %s\n", url)
-        
+
         req, err := http.NewRequest("GET", url + "?F=0", nil)
         req.SetBasicAuth(name, pw)
         resp, err := client.Do(req)
-        
+
         ch <- &HttpResponse{url, resp, err}
     }(dirUrl)
 
@@ -88,7 +88,7 @@ func asyncHttpGetFile(fileUrl string) bool {
         parts := strings.Split(fileUrl, "/")
         fileName, _ := url.QueryUnescape(parts[len(parts) - 1])
         fileName = cleanName(fileName)
-        
+
         // check if file exists or skip
         if _, err := os.Stat(fileName); err == nil {
             fmt.Printf("\n%s exists already; skipping\n", fileName)
@@ -98,16 +98,16 @@ func asyncHttpGetFile(fileUrl string) bool {
             out, err := os.Create(fixPath(fileName))
             defer out.Close()
             if err != nil { panic(err) }
-            
+
             req, err := http.NewRequest("GET", fileUrl, nil)
             req.SetBasicAuth(name, pw)
             resp, err := client.Do(req)
             defer resp.Body.Close()
             if err != nil { panic(err) }
-            
+
             n, err := io.Copy(out, resp.Body)
             if err != nil { panic(err) }
-            
+
             ch <- n
         }
     }(fileUrl)
@@ -121,7 +121,7 @@ func asyncHttpGetFile(fileUrl string) bool {
             fmt.Printf(".")
         }
     }
-    
+
     return true
 }
 
@@ -143,7 +143,7 @@ func recursiveLoadDir(dirUrl string) bool {
         fmt.Printf("could not download dir, get status: %s\n", result.response.Status)
         return false
     }
-    
+
     body, _ := ioutil.ReadAll(result.response.Body)
 
     var q Page
@@ -157,30 +157,30 @@ func recursiveLoadDir(dirUrl string) bool {
         parts := strings.Split(dirUrl, "/")
         dirName, err := url.QueryUnescape(parts[len(parts) - 2])
         dirName = cleanName(dirName)
-        
+
         if _, err := os.Stat(dirName); os.IsNotExist(err) {
             fmt.Printf("\ncreate dir: '%s'\n", dirName)
             err = os.Mkdir("./" + dirName, os.ModeDir)
             if err != nil { panic(err) }
         }
-        
+
         err = os.Chdir(dirName)
         if err != nil { panic(err) }
-    
+
         for _, game := range q.ATags[1:] {
             fmt.Printf("\nlink found on page: %s", game.Href)
-            
+
             if game.Href[len(game.Href) - 1] != 47 {
                 asyncHttpGetFile(dirUrl + game.Href)
             } else {
                 recursiveLoadDir(dirUrl + game.Href)
             }
         }
-        
+
         err = os.Chdir("..")
         if err != nil { panic(err) }
     }
-    
+
     return true
 }
 
@@ -191,18 +191,19 @@ func main() {
     flag.StringVar(&name, "name", "", "username")
     flag.StringVar(&pw, "pw", "", "password")
     flag.StringVar(&dirUrl, "link", "", "directory page link")
+    flag.StringVar(&target, "target", "", "directory target dir")
     flag.StringVar(&proxy, "proxy", "", "proxy in format 'http://10.0.0.1:1234'")
     flag.Parse()
-    
+
     if len(proxy) > 0 {
         proxyUrl, _ := url.Parse(proxy)
         client = &http.Client{Transport: &http.Transport{Proxy: http.ProxyURL(proxyUrl)}}
     } else {
         client = &http.Client{}
     }
-    
+
     var dirUrls []string
-    
+
     scanner := bufio.NewScanner(os.Stdin)
     if len(name) == 0 {
         fmt.Print("Enter name: ")
@@ -233,14 +234,19 @@ func main() {
     } else {
         dirUrls = []string{dirUrl}
     }
-    
+
     fmt.Printf("dirUrls %s\n", dirUrls)
     if len(dirUrls) == 0 {
         fmt.Println("you need to enter urls or use start params:")
         flag.PrintDefaults()
         return
     }
-    
+
+    if len(target) > 0 {
+        err := os.Chdir(target)
+        if err != nil { panic(err) }
+    }
+
     for _, durl := range dirUrls {
         if durl[len(durl) - 1] != 47 {
             asyncHttpGetFile(durl)
