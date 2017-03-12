@@ -160,7 +160,7 @@ func recursiveLoadDir(dirUrl string) bool {
 
         if _, err := os.Stat(dirName); os.IsNotExist(err) {
             fmt.Printf("\ncreate dir: '%s'\n", dirName)
-            err = os.Mkdir("./" + dirName, os.ModeDir)
+            err = os.Mkdir("./" + dirName, os.ModeDir | 0775)
             if err != nil { panic(err) }
         }
 
@@ -186,7 +186,6 @@ func recursiveLoadDir(dirUrl string) bool {
 
 
 func main() {
-
     var proxy string
     flag.StringVar(&name, "name", "", "username")
     flag.StringVar(&pw, "pw", "", "password")
