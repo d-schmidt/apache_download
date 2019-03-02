@@ -1,28 +1,54 @@
 package main
 
 import (
+    "bufio"
+    "encoding/xml"
+    "flag"
     "fmt"
-    "net/http"
-    "time"
     "io"
     "io/ioutil"
-    "os"
+    "net/http"
     "net/url"
-    "encoding/xml"
-    "strings"
+    "os"
     "runtime"
-    "flag"
-    "bufio"
+    "strconv"
+    "strings"
+    "time"
 )
 
+const SLASH = 47
+
 var name, pw, dirUrl, target string
+var skipExisting bool
 var client *http.Client
 
 
+type ResultStatus int
+const (
+    SUCCESS ResultStatus = iota
+    RETRY
+    SKIP
+    ERROR
+)
+type Result struct {
+    status   ResultStatus
+    bytes    int64
+}
+
 type HttpResponse struct {
-    url      string
     response *http.Response
     err      error
+}
+
+
+type DownloadFunc func(url string) ResultStatus
+func doWhileRetry(url string, downloadFunc DownloadFunc) {
+    for i := 1; i <= 5; i++ {
+        if downloadFunc(url) != RETRY {
+            break
+        }
+        time.Sleep(time.Duration(i * 5) * time.Second)
+    }
 }
 
 
@@ -31,6 +57,7 @@ func fixPath(path string) string {
     if err != nil { panic(err) }
 
     result := pwd + string(os.PathSeparator) + path
+
     // fix to long pathes for windows
     if len(result) > 259 && runtime.GOOS == "windows" {
         result = "\\\\?\\" + result
@@ -61,68 +88,161 @@ func asyncHttpGetDir(dirUrl string) *HttpResponse {
     go func(url string) {
         fmt.Printf("\nDownloading directory %s\n", url)
 
-        req, err := http.NewRequest("GET", url + "?F=0", nil)
+        req, _ := http.NewRequest("GET", url + "?F=0", nil)
         req.SetBasicAuth(name, pw)
         resp, err := client.Do(req)
 
-        ch <- &HttpResponse{url, resp, err}
+        ch <- &HttpResponse{resp, err}
     }(dirUrl)
 
     for {
         select {
         case r := <-ch:
-            fmt.Printf("\ndirectory page download done, error: %v\n", r.err)
+            fmt.Printf("\ndirectory page download done: %s %s\n", r.err, dirUrl)
             return r
         case <-time.After(100 * time.Millisecond):
             fmt.Printf(".")
         }
     }
+
     return &HttpResponse{}
 }
 
 
-func asyncHttpGetFile(fileUrl string) bool {
-    ch := make(chan int64)
+func pathExists(path string) bool {
+    _, err := os.Stat(path)
+    if err != nil && !os.IsNotExist(err) {
+        panic(err)
+    }
+    return err == nil
+}
+
+
+func openFile(fileName string) (*os.File, bool) {
+    if skipExisting && pathExists(fileName) {
+        fmt.Printf("\n%s exists already; skipping\n", fileName)
+        return nil, false
+    }
+
+    fmt.Printf("\nSaving to file '%s'\n", fileName)
+    out, err := os.OpenFile(fileName, os.O_APPEND|os.O_CREATE|os.O_RDWR, 0666)
+    if err != nil { panic(err) }
+    return out, true
+}
+
+
+func isFileAppendPossible(out *os.File, fileUrl string) ResultStatus {
+    info, err := out.Stat()
+    if err != nil { panic(err) }
+
+    if info.Size() > 0 {
+        req, _ := http.NewRequest("HEAD", fileUrl, nil)
+        req.SetBasicAuth(name, pw)
+
+        resp, err := client.Do(req)
+        if err != nil {
+            fmt.Printf("\nConnection error for url: %v %s\n", err, fileUrl)
+            return RETRY
+        }
+        resp.Body.Close()
+
+        if resp.StatusCode != 200 {
+            fmt.Printf("\nBad HEAD response for url: %s %s\n", resp.Status, fileUrl)
+            if resp.StatusCode >= 500 {
+                return RETRY
+            }
+            return ERROR
+        }
+
+        cLength, err := strconv.Atoi(resp.Header.Get("Content-Length"))
+        if err != nil {
+            fmt.Printf("\nContent-Length header error\n")
+            return ERROR
+
+        }
+        if int64(cLength) >= info.Size() {
+            fmt.Printf("\nFile is already complete or Content-Length header error\n")
+            return SKIP
+        }
+        if "bytes" != resp.Header.Get("Accept-Ranges") {
+            fmt.Printf("\nServer does not accept bytes ranges to download partial file\n")
+            return ERROR
+        }
+    }
+
+    return SUCCESS
+}
+
+func asyncHttpGetFile(fileUrl string) ResultStatus {
+    ch := make(chan *Result)
 
     go func(fileUrl string) {
         parts := strings.Split(fileUrl, "/")
         fileName, _ := url.QueryUnescape(parts[len(parts) - 1])
-        fileName = cleanName(fileName)
-
-        // check if file exists or skip
-        if _, err := os.Stat(fileName); err == nil {
-            fmt.Printf("\n%s exists already; skipping\n", fileName)
-            ch <- 0
-        } else {
-            fmt.Printf("\nLoading file '%s'\n", fileName)
-            out, err := os.Create(fixPath(fileName))
-            defer out.Close()
-            if err != nil { panic(err) }
-
-            req, err := http.NewRequest("GET", fileUrl, nil)
-            req.SetBasicAuth(name, pw)
-            resp, err := client.Do(req)
-            defer resp.Body.Close()
-            if err != nil { panic(err) }
-
-            n, err := io.Copy(out, resp.Body)
-            if err != nil { panic(err) }
-
-            ch <- n
+        fileName = fixPath(cleanName(fileName))
+        isNewFile := pathExists(fileName)
+        var out *os.File
+        out, success := openFile(fileName)
+        if !success {
+            ch <- &Result{SKIP, 0}
+            return
         }
+        defer out.Close()
+
+        if !isNewFile {
+            if status := isFileAppendPossible(out, fileUrl); status != SUCCESS {
+                ch <- &Result{status, 0}
+                return
+            }
+        }
+
+        info, _ := out.Stat()
+        req, _ := http.NewRequest("GET", fileUrl, nil)
+        req.SetBasicAuth(name, pw)
+        req.Header.Add("Range", fmt.Sprintf("bytes=%d-", info.Size()))
+
+        resp, err := client.Do(req)
+        if err != nil {
+            fmt.Printf("\nConnection error for url: %v %s\n", err, fileUrl)
+            ch <- &Result{RETRY, 0}
+            return
+        }
+        defer resp.Body.Close()
+
+        if resp.StatusCode >= 300 {
+            fmt.Printf("\nBad GET response for url: %s %s\n", resp.Status, fileUrl)
+            if resp.StatusCode >= 500 {
+                ch <- &Result{RETRY, 0}
+            } else {
+                ch <- &Result{ERROR, 0}
+            }
+            return
+        }
+
+        cLength, _ := strconv.Atoi(resp.Header.Get("Content-Length"))
+        fmt.Printf("\nDownload size: %d\n", cLength)
+
+        n, err := io.Copy(out, resp.Body)
+        if err != nil {
+            fmt.Printf("\nDownload error for url: %v %s\n", err, fileUrl)
+            ch <- &Result{RETRY, n}
+            return
+        }
+
+        ch <- &Result{SUCCESS, n}
     }(fileUrl)
 
     for {
         select {
         case r := <-ch:
-            fmt.Printf("%d bytes loaded\n", r)
-            return true
-        case <-time.After(3 * time.Second):
+            fmt.Printf("%d bytes loaded (Status %d)\n", r.bytes, r.status)
+            return r.status
+        case <-time.After(5 * time.Second):
             fmt.Printf(".")
         }
     }
 
-    return true
+    return ERROR
 }
 
 
@@ -135,30 +255,42 @@ type Link struct {
 }
 
 
-func recursiveLoadDir(dirUrl string) bool {
+func chDirUp() {
+    err := os.Chdir("..")
+    if err != nil { panic(err) }
+}
+
+
+func recursiveLoadDir(dirUrl string) ResultStatus {
     result := asyncHttpGetDir(dirUrl)
+    if result.err != nil {
+        fmt.Printf("\nConnection error for directory url: %v %s\n", result.err, dirUrl)
+        return RETRY
+    }
     defer result.response.Body.Close()
 
-    if result.response.StatusCode != 200 || result.err != nil {
-        fmt.Printf("could not download dir, get status: %s\n", result.response.Status)
-        return false
+    if result.response.StatusCode != 200 {
+        fmt.Printf("\nBad GET response for url: %s %s\n", result.response.Status, dirUrl)
+        if result.response.StatusCode >= 500 {
+            return RETRY
+        }
+        return ERROR
     }
 
     body, _ := ioutil.ReadAll(result.response.Body)
 
-    var q Page
-
-    if xmlerr := xml.Unmarshal(body, &q); xmlerr != nil {
-        fmt.Printf("XMLERROR %s\n", xmlerr)
-        panic(xmlerr)
+    var page Page
+    if xmlerr := xml.Unmarshal(body, &page); xmlerr != nil {
+        fmt.Printf("XMLERROR while reading directory html: %v\n", xmlerr)
+        return ERROR
     }
 
-    if len(q.ATags) > 1 {
+    if len(page.ATags) > 1 {
         parts := strings.Split(dirUrl, "/")
         dirName, err := url.QueryUnescape(parts[len(parts) - 2])
         dirName = cleanName(dirName)
 
-        if _, err := os.Stat(dirName); os.IsNotExist(err) {
+        if !pathExists(dirName) {
             fmt.Printf("\ncreate dir: '%s'\n", dirName)
             err = os.Mkdir("./" + dirName, os.ModeDir | 0775)
             if err != nil { panic(err) }
@@ -166,22 +298,20 @@ func recursiveLoadDir(dirUrl string) bool {
 
         err = os.Chdir(dirName)
         if err != nil { panic(err) }
+        defer chDirUp()
 
-        for _, game := range q.ATags[1:] {
+        for _, game := range page.ATags[1:] {
             fmt.Printf("\nlink found on page: %s", game.Href)
 
-            if game.Href[len(game.Href) - 1] != 47 {
-                asyncHttpGetFile(dirUrl + game.Href)
+            if game.Href[len(game.Href) - 1] != SLASH {
+                doWhileRetry(dirUrl + game.Href, asyncHttpGetFile)
             } else {
-                recursiveLoadDir(dirUrl + game.Href)
+                doWhileRetry(dirUrl + game.Href, recursiveLoadDir)
             }
         }
-
-        err = os.Chdir("..")
-        if err != nil { panic(err) }
     }
 
-    return true
+    return SUCCESS
 }
 
 
@@ -192,6 +322,7 @@ func main() {
     flag.StringVar(&dirUrl, "link", "", "directory page link")
     flag.StringVar(&target, "target", "", "directory target dir")
     flag.StringVar(&proxy, "proxy", "", "proxy in format 'http://10.0.0.1:1234'")
+    flag.BoolVar(&skipExisting, "skip", false, "skip existing files completely [default: false]")
     flag.Parse()
 
     if len(proxy) > 0 {
@@ -246,11 +377,11 @@ func main() {
         if err != nil { panic(err) }
     }
 
-    for _, durl := range dirUrls {
-        if durl[len(durl) - 1] != 47 {
-            asyncHttpGetFile(durl)
+    for _, dirUrl := range dirUrls {
+        if dirUrl[len(dirUrl) - 1] != SLASH {
+            doWhileRetry(dirUrl, asyncHttpGetFile)
         } else {
-            recursiveLoadDir(durl)
+            doWhileRetry(dirUrl, recursiveLoadDir)
         }
     }
     fmt.Printf("the end")
