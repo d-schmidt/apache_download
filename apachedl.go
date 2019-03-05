@@ -29,6 +29,8 @@ const (
     RETRY
     SKIP
     ERROR
+    START
+    WORKING
 )
 type Result struct {
     status   ResultStatus
@@ -173,72 +175,117 @@ func isFileAppendPossible(out *os.File, fileUrl string) ResultStatus {
     return SUCCESS
 }
 
-func asyncHttpGetFile(fileUrl string) ResultStatus {
-    ch := make(chan *Result)
 
-    go func(fileUrl string) {
-        parts := strings.Split(fileUrl, "/")
-        fileName, _ := url.QueryUnescape(parts[len(parts) - 1])
-        fileName = fixPath(cleanName(fileName))
-        isNewFile := pathExists(fileName)
-        var out *os.File
-        out, success := openFile(fileName)
-        if !success {
-            ch <- &Result{SKIP, 0}
-            return
-        }
-        defer out.Close()
-
-        if !isNewFile {
-            if status := isFileAppendPossible(out, fileUrl); status != SUCCESS {
-                ch <- &Result{status, 0}
-                return
-            }
-        }
-
-        info, _ := out.Stat()
-        req, _ := http.NewRequest("GET", fileUrl, nil)
-        req.SetBasicAuth(name, pw)
-        req.Header.Add("Range", fmt.Sprintf("bytes=%d-", info.Size()))
-
-        resp, err := client.Do(req)
-        if err != nil {
-            fmt.Printf("\nConnection error for url: %v %s\n", err, fileUrl)
-            ch <- &Result{RETRY, 0}
-            return
-        }
-        defer resp.Body.Close()
-
-        if resp.StatusCode >= 300 {
-            fmt.Printf("\nBad GET response for url: %s %s\n", resp.Status, fileUrl)
-            if resp.StatusCode >= 500 {
-                ch <- &Result{RETRY, 0}
-            } else {
-                ch <- &Result{ERROR, 0}
-            }
-            return
-        }
-
-        cLength, _ := strconv.Atoi(resp.Header.Get("Content-Length"))
-        fmt.Printf("\nDownload size: %d\n", cLength)
-
-        n, err := io.Copy(out, resp.Body)
-        if err != nil {
-            fmt.Printf("\nDownload error for url: %v %s\n", err, fileUrl)
-            ch <- &Result{RETRY, n}
-            return
-        }
-
-        ch <- &Result{SUCCESS, n}
-    }(fileUrl)
-
+func updateStatus(out *os.File, resultChannel chan *Result, stopChannel chan bool) {
     for {
         select {
-        case r := <-ch:
-            fmt.Printf("%d bytes loaded (Status %d)\n", r.bytes, r.status)
-            return r.status
-        case <-time.After(5 * time.Second):
-            fmt.Printf(".")
+            case <-stopChannel:
+                return
+            case <-time.After(10 * time.Second):
+                out.Sync()
+                info, _ := out.Stat()
+                resultChannel <- &Result{WORKING, info.Size()}
+        }
+    }
+}
+
+
+func httpGetFile(fileUrl string, resultChannel chan *Result, stopChannel chan bool) {
+
+    parts := strings.Split(fileUrl, "/")
+    fileName, _ := url.QueryUnescape(parts[len(parts) - 1])
+    fileName = fixPath(cleanName(fileName))
+    isNewFile := pathExists(fileName)
+
+    var out *os.File
+    out, success := openFile(fileName)
+    if !success {
+        resultChannel <- &Result{SKIP, 0}
+        return
+    }
+    defer out.Close()
+
+    if !isNewFile {
+        if status := isFileAppendPossible(out, fileUrl); status != SUCCESS {
+            resultChannel <- &Result{status, 0}
+            return
+        }
+    }
+
+    info, _ := out.Stat()
+    req, _ := http.NewRequest("GET", fileUrl, nil)
+    req.SetBasicAuth(name, pw)
+    if info.Size() > 0 {
+        fmt.Printf("\nContinue existing file at %6.1f MiB\n", float64(info.Size()) / 1024 / 1024)
+        req.Header.Add("Range", fmt.Sprintf("bytes=%d-", info.Size()))
+    }
+
+    resp, err := client.Do(req)
+    if err != nil {
+        fmt.Printf("\nConnection error for url: %v %s\n", err, fileUrl)
+        resultChannel <- &Result{RETRY, 0}
+        return
+    }
+    defer resp.Body.Close()
+
+    if resp.StatusCode >= 300 {
+        fmt.Printf("\nBad GET response for url: %s %s\n", resp.Status, fileUrl)
+        if resp.StatusCode >= 500 {
+            resultChannel <- &Result{RETRY, 0}
+        } else {
+            resultChannel <- &Result{ERROR, 0}
+        }
+        return
+    }
+
+    cLength, _ := strconv.Atoi(resp.Header.Get("Content-Length"))
+    resultChannel <- &Result{START, int64(cLength) + info.Size()}
+
+    go updateStatus(out, resultChannel, stopChannel)
+    n, err := io.Copy(out, resp.Body)
+    if err != nil {
+        fmt.Printf("\nDownload error for url: %v %s\n", err, fileUrl)
+        resultChannel <- &Result{RETRY, n}
+        return
+    }
+
+    resultChannel <- &Result{SUCCESS, n}
+}
+
+
+func asyncHttpGetFile(fileUrl string) ResultStatus {
+    resultChannel := make(chan *Result)
+    stopChannel := make(chan bool)
+    defer func() { stopChannel <- true }()
+
+    go httpGetFile(fileUrl, resultChannel, stopChannel)
+
+    var size int64
+    start := time.Now()
+    var last int64
+
+    for result := range resultChannel {
+        done := float64(result.bytes - last) / 1024 / 1024
+
+        switch result.status {
+        case START:
+            size = result.bytes
+            fmt.Printf("%s - %6.1f MiB file size\n", start.Format(time.Stamp), done)
+        case WORKING:
+
+            elapsed := time.Now().Sub(start).Seconds()
+            start = time.Now()
+            mbps := done / elapsed
+
+            fmt.Printf("%s - %6.1f MiB done (%3d%% %.2f MBps)\n",
+                time.Now().Format(time.Stamp),
+                float64(result.bytes) / 1024 / 1024,
+                result.bytes * 100 / size,
+                mbps)
+
+            last = result.bytes
+        default:
+            return result.status
         }
     }
 
@@ -300,8 +347,10 @@ func recursiveLoadDir(dirUrl string) ResultStatus {
         if err != nil { panic(err) }
         defer chDirUp()
 
+        i := 1
         for _, game := range page.ATags[1:] {
-            fmt.Printf("\nlink found on page: %s", game.Href)
+            fmt.Printf("\n%2d/%2d link found on page: %s", i, len(page.ATags) - 1,game.Href)
+            i++
 
             if game.Href[len(game.Href) - 1] != SLASH {
                 doWhileRetry(dirUrl + game.Href, asyncHttpGetFile)
