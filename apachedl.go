@@ -54,6 +54,11 @@ func doWhileRetry(url string, downloadFunc DownloadFunc) {
 }
 
 
+func toMiB(bytes int64) float64 {
+    return float64(bytes) / 1024 / 1024
+}
+
+
 func fixPath(path string) string {
     pwd, err := os.Getwd()
     if err != nil { panic(err) }
@@ -216,7 +221,7 @@ func httpGetFile(fileUrl string, resultChannel chan *Result, stopChannel chan bo
     req, _ := http.NewRequest("GET", fileUrl, nil)
     req.SetBasicAuth(name, pw)
     if info.Size() > 0 {
-        fmt.Printf("\nContinue existing file at %6.1f MiB\n", float64(info.Size()) / 1024 / 1024)
+        fmt.Printf("\nContinue existing file at %6.1f MiB\n", toMiB(info.Size()))
         req.Header.Add("Range", fmt.Sprintf("bytes=%d-", info.Size()))
     }
 
@@ -265,7 +270,8 @@ func asyncHttpGetFile(fileUrl string) ResultStatus {
     var last int64
 
     for result := range resultChannel {
-        done := float64(result.bytes - last) / 1024 / 1024
+        done := toMiB(result.bytes - last)
+        last = result.bytes
 
         switch result.status {
         case START:
@@ -279,11 +285,10 @@ func asyncHttpGetFile(fileUrl string) ResultStatus {
 
             fmt.Printf("%s - %6.1f MiB done (%3d%% %.2f MBps)\n",
                 time.Now().Format(time.Stamp),
-                float64(result.bytes) / 1024 / 1024,
+                toMiB(result.bytes),
                 result.bytes * 100 / size,
                 mbps)
 
-            last = result.bytes
         default:
             return result.status
         }
