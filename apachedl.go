@@ -2,7 +2,6 @@ package main
 
 import (
     "bufio"
-    "encoding/xml"
     "flag"
     "fmt"
     "io"
@@ -10,13 +9,17 @@ import (
     "net/http"
     "net/url"
     "os"
+    "regexp"
     "runtime"
     "strconv"
     "strings"
     "time"
+
+    "github.com/d-schmidt/soup"
 )
 
 const SLASH = 47
+const GET_RETRIES = 5
 
 var name, pw, dirUrl, target string
 var skipExisting bool
@@ -45,7 +48,7 @@ type HttpResponse struct {
 
 type DownloadFunc func(url string) ResultStatus
 func doWhileRetry(url string, downloadFunc DownloadFunc) {
-    for i := 1; i <= 5; i++ {
+    for i := 1; i <= GET_RETRIES; i++ {
         if downloadFunc(url) != RETRY {
             break
         }
@@ -93,9 +96,9 @@ func asyncHttpGetDir(dirUrl string) *HttpResponse {
     ch := make(chan *HttpResponse)
 
     go func(url string) {
-        fmt.Printf("\nDownloading directory %s\n", url)
+        fmt.Println("Downloading directory html", url)
 
-        req, _ := http.NewRequest("GET", url + "?F=0", nil)
+        req, _ := http.NewRequest("GET", url, nil)
         req.SetBasicAuth(name, pw)
         resp, err := client.Do(req)
 
@@ -105,7 +108,7 @@ func asyncHttpGetDir(dirUrl string) *HttpResponse {
     for {
         select {
         case r := <-ch:
-            fmt.Printf("\ndirectory page download done: %s %s\n", r.err, dirUrl)
+            fmt.Println("Directory html download done")
             return r
         case <-time.After(100 * time.Millisecond):
             fmt.Printf(".")
@@ -131,7 +134,7 @@ func openFile(fileName string) (*os.File, bool) {
         return nil, false
     }
 
-    fmt.Printf("\nSaving to file '%s'\n", fileName)
+    fmt.Printf("Saving to file '%s'\n", fileName)
     out, err := os.OpenFile(fileName, os.O_APPEND|os.O_CREATE|os.O_RDWR, 0666)
     if err != nil { panic(err) }
     return out, true
@@ -298,12 +301,52 @@ func asyncHttpGetFile(fileUrl string) ResultStatus {
 }
 
 
-type Page struct {
-    ATags []Link `xml:"body>ul>li>a"`
-}
+func findLinks(html []byte, dirUrl string) []string {
+    doc := soup.HTMLParse(string(html))
+    links := doc.FindAll("a")
 
-type Link struct {
-    Href string `xml:"href,attr"`
+    // regex: optional host + path as group + optional parameters
+    urlPattern := regexp.MustCompile(`^(?:(?:https?:)?//([^/]+))?([^?#]+).*$`)
+    dirHost := urlPattern.FindStringSubmatch(dirUrl)[1]
+    dirPath := urlPattern.FindStringSubmatch(dirUrl)[2]
+    var result []string
+    fmt.Println("Extracting links from url:", dirUrl, "host+path", dirHost, dirPath)
+
+    for _, link := range links {
+        href := link.Attrs()["href"]
+        if len(href) > 0 {
+            match := urlPattern.FindStringSubmatch(href)
+
+            // if match and host is empty or dirHost
+            if len(match) > 1 && (len(match[1]) == 0 ||  match[1] == dirHost) {
+                path := match[2]
+
+                // handle root url paths starting with '/'
+                if path[0] == SLASH {
+                    if len(path) > len(dirPath) && path[:len(dirPath)] == dirPath {
+                        // if start of path matches current dir, cut it of
+                        path = path[len(dirPath):]
+                    }  else {
+                        // else ignore; we don't want to go up, only deeper
+                        path = ""
+                    }
+                }
+
+                if len(path) >= 2 && path[:2] == ".." {
+                    path = ""
+                }
+
+                // TODO remove starting with /
+                if (len(path) > 0) {
+                    fullLink := dirUrl + path
+                    fmt.Println("Using link:", fullLink)
+                    result = append(result, fullLink)
+                }
+            }
+        }
+    }
+
+    return result
 }
 
 
@@ -330,20 +373,16 @@ func recursiveLoadDir(dirUrl string) ResultStatus {
     }
 
     body, _ := ioutil.ReadAll(result.response.Body)
+    links := findLinks(body, dirUrl)
 
-    var page Page
-    if xmlerr := xml.Unmarshal(body, &page); xmlerr != nil {
-        fmt.Printf("XMLERROR while reading directory html: %v\n", xmlerr)
-        return ERROR
-    }
-
-    if len(page.ATags) > 1 {
+    if len(links) > 0 {
+        // get last directory part of path (i.e. b of http://example.com/a/b/)
         parts := strings.Split(dirUrl, "/")
         dirName, err := url.QueryUnescape(parts[len(parts) - 2])
         dirName = cleanName(dirName)
 
         if !pathExists(dirName) {
-            fmt.Printf("\ncreate dir: '%s'\n", dirName)
+            fmt.Println("Creating local directory:", dirName)
             err = os.Mkdir("./" + dirName, os.ModeDir | 0775)
             if err != nil { panic(err) }
         }
@@ -352,15 +391,13 @@ func recursiveLoadDir(dirUrl string) ResultStatus {
         if err != nil { panic(err) }
         defer chDirUp()
 
-        i := 1
-        for _, game := range page.ATags[1:] {
-            fmt.Printf("\n%2d/%2d link found on page: %s", i, len(page.ATags) - 1,game.Href)
-            i++
+        for i, link := range links {
+            fmt.Printf("\nlink %2d/%2d: %s\n", i+1, len(links), link)
 
-            if game.Href[len(game.Href) - 1] != SLASH {
-                doWhileRetry(dirUrl + game.Href, asyncHttpGetFile)
+            if link[len(link) - 1] != SLASH {
+                doWhileRetry(link, asyncHttpGetFile)
             } else {
-                doWhileRetry(dirUrl + game.Href, recursiveLoadDir)
+                doWhileRetry(link, recursiveLoadDir)
             }
         }
     }
